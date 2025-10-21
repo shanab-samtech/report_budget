@@ -1,34 +1,33 @@
 // Copyright (c) 2025, Samtech and contributors
 // For license information, please see license.txt
 
-
 frappe.query_reports["Custom Budget Variance Report"] = {
 	filters: get_filters(),
+
+	onload: function (report) {
+		// Hide date filters initially if fiscal year mode is active
+		let filter_type = frappe.query_report.get_filter_value("filter_type") || "fiscal_year";
+		toggle_filter_fields(filter_type);
+	},
+
 	formatter: function (value, row, column, data, default_formatter) {
 		value = default_formatter(value, row, column, data);
-
-		if (column.fieldname.includes(__("variance"))) {
-			if (data[column.fieldname] < 0) {
-				value = "<span style='color:red'>" + value + "</span>";
-			} else if (data[column.fieldname] > 0) {
-				value = "<span style='color:green'>" + value + "</span>";
-			}
+		if (column.fieldname === "actual" && data[column.fieldname] < 0) {
+			value = `<span style="color:red">${value}</span>`;
 		}
-
 		return value;
 	},
 };
+
 function get_filters() {
 	function get_dimensions() {
 		let result = [];
 		frappe.call({
 			method: "erpnext.accounts.doctype.accounting_dimension.accounting_dimension.get_dimensions",
-			args: {
-				with_cost_center_and_project: true,
-			},
+			args: { with_cost_center_and_project: true },
 			async: false,
 			callback: function (r) {
-				if (!r.exc) {
+				if (!r.exc && r.message?.[0]) {
 					result = r.message[0].map((elem) => elem.document_type);
 				}
 			},
@@ -38,7 +37,23 @@ function get_filters() {
 
 	let budget_against_options = get_dimensions();
 
-	let filters = [
+	return [
+		{
+			fieldname: "filter_type",
+			label: __("Filter Type"),
+			fieldtype: "Select",
+			options: [
+				{ label: __("Fiscal Year"), value: "fiscal_year" },
+				{ label: __("Date Range"), value: "date_range" },
+			],
+			default: "fiscal_year",
+			reqd: 1,
+			on_change: function () {
+				let filter_type = frappe.query_report.get_filter_value("filter_type");
+				toggle_filter_fields(filter_type);
+				frappe.query_report.refresh();
+			},
+		},
 		{
 			fieldname: "from_fiscal_year",
 			label: __("From Fiscal Year"),
@@ -56,17 +71,18 @@ function get_filters() {
 			reqd: 1,
 		},
 		{
-			fieldname: "period",
-			label: __("Period"),
-			fieldtype: "Select",
-			options: [
-				{ value: "Monthly", label: __("Monthly") },
-				{ value: "Quarterly", label: __("Quarterly") },
-				{ value: "Half-Yearly", label: __("Half-Yearly") },
-				{ value: "Yearly", label: __("Yearly") },
-			],
-			default: "Yearly",
-			reqd: 1,
+			fieldname: "from_date",
+			label: __("From Date"),
+			fieldtype: "Date",
+			default: frappe.datetime.add_months(frappe.datetime.get_today(), -1),
+			hidden: 1,
+		},
+		{
+			fieldname: "to_date",
+			label: __("To Date"),
+			fieldtype: "Date",
+			default: frappe.datetime.get_today(),
+			hidden: 1,
 		},
 		{
 			fieldname: "company",
@@ -83,32 +99,35 @@ function get_filters() {
 			options: budget_against_options,
 			default: "Cost Center",
 			reqd: 1,
-			on_change: function () {
-				frappe.query_report.set_filter_value("budget_against_filter", []);
-				frappe.query_report.refresh();
-			},
 		},
 		{
 			fieldname: "budget_against_filter",
 			label: __("Dimension Filter"),
 			fieldtype: "MultiSelectList",
-			options: "budget_against",
 			get_data: function (txt) {
-				if (!frappe.query_report.filters) return;
-
 				let budget_against = frappe.query_report.get_filter_value("budget_against");
 				if (!budget_against) return;
-
 				return frappe.db.get_link_options(budget_against, txt);
 			},
 		},
-		{
-			fieldname: "show_cumulative",
-			label: __("Show Cumulative Amount"),
-			fieldtype: "Check",
-			default: 0,
-		},
 	];
+}
 
-	return filters;
+function toggle_filter_fields(filter_type) {
+	// Correct logic: show fiscal year fields when fiscal_year is selected
+	let show_fy = filter_type === "fiscal_year";
+
+	frappe.query_report.toggle_filter_display("from_fiscal_year", show_fy);
+	frappe.query_report.toggle_filter_display("to_fiscal_year", show_fy);
+	frappe.query_report.toggle_filter_display("from_date", !show_fy);
+	frappe.query_report.toggle_filter_display("to_date", !show_fy);
+
+	// Reset values appropriately
+	if (show_fy) {
+		frappe.query_report.set_filter_value("from_date", null);
+		frappe.query_report.set_filter_value("to_date", null);
+	} else {
+		frappe.query_report.set_filter_value("from_fiscal_year", null);
+		frappe.query_report.set_filter_value("to_fiscal_year", null);
+	}
 }
