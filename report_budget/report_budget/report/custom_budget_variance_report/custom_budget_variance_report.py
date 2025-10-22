@@ -1,9 +1,14 @@
 # Copyright (c) 2025, Samtech and contributors
 # For license information, please see license.txt
 
+
+import datetime
+
 import frappe
 from frappe import _
-from frappe.utils import flt
+from frappe.utils import flt, formatdate
+
+from erpnext.controllers.trends import get_period_date_ranges, get_period_month_ranges
 
 
 def execute(filters=None):
@@ -11,129 +16,413 @@ def execute(filters=None):
 		filters = {}
 
 	columns = get_columns(filters)
-
-	filter_type = filters.get("filter_type") or "fiscal_year"
-
-	if filter_type == "date_range":
-		date_cond = "and gl.posting_date between %(from_date)s and %(to_date)s"
+	if filters.get("budget_against_filter"):
+		dimensions = filters.get("budget_against_filter")
 	else:
-		date_cond = "and gl.fiscal_year between %(from_fiscal_year)s and %(to_fiscal_year)s"
+		dimensions = get_cost_centers(filters)
 
-	dimensions = (
-		filters.get("budget_against_filter")
-		or get_cost_centers(filters)
-	)
+	period_month_ranges = get_period_month_ranges(filters["period"], filters["from_fiscal_year"])
+	cam_map = get_dimension_account_month_map(filters)
 
 	data = []
-
 	for dimension in dimensions:
-		# Fetch all expense accounts (not group, not disabled)
-		accounts = frappe.db.sql(
-			"""
-			select name
-			from `tabAccount`
-			where
-				company = %s
-				and root_type = 'Expense'
-				and is_group = 0
-				and disabled = 0
-			order by name
-			""",
-			(filters.get("company"),),
-			as_dict=True,
-		)
+		dimension_items = cam_map.get(dimension)
+		if dimension_items:
+			# Pass actual_only=True to get_final_data
+			data = get_final_data(dimension, dimension_items, filters, period_month_ranges, data, 0, actual_only=True)
 
-		for acc in accounts:
-			actual = frappe.db.sql(
-				f"""
-				select
-					sum(gl.debit - gl.credit)
-				from
-					`tabGL Entry` gl
-				where
-					gl.company = %(company)s
-					and gl.account = %(account)s
-					and gl.{frappe.scrub(filters.get("budget_against"))} = %(dimension)s
-					and gl.is_cancelled = 0
-					{date_cond}
-				""",
-				{
-					"company": filters.get("company"),
-					"account": acc.name,
-					"dimension": dimension,
-					"from_fiscal_year": filters.get("from_fiscal_year"),
-					"to_fiscal_year": filters.get("to_fiscal_year"),
-					"from_date": filters.get("from_date"),
-					"to_date": filters.get("to_date"),
-				},
-			)[0][0] or 0.0
+	chart = get_chart_data(filters, columns, data, actual_only=True) # Pass actual_only=True
 
-			data.append({
-				"budget_against": dimension,
-				"account": acc.name,
-				"actual": flt(actual),
-			})
-
-	chart = get_chart_data(data)
 	return columns, data, None, chart
 
+
+# Modified to only include Actual and exclude Budget and Variance
+def get_final_data(dimension, dimension_items, filters, period_month_ranges, data, DCC_allocation, actual_only=False):
+	for account, monthwise_data in dimension_items.items():
+		row = [dimension, account]
+		totals = [0, 0, 0] # totals[0]=Budget, totals[1]=Actual, totals[2]=Variance
+		
+		# Fieldnames to track: target (Budget), actual, variance. 
+		# We only care about actual (index 1) for the output row.
+		fieldnames_to_process = ["target", "actual", "variance"] 
+		
+		for year in get_fiscal_years(filters):
+			last_total = 0 # Used for cumulative Budget - Actual
+			
+			for relevant_months in period_month_ranges:
+				period_data = [0, 0, 0] # period_data[0]=Budget, period_data[1]=Actual, period_data[2]=Variance
+				
+				for month in relevant_months:
+					if monthwise_data.get(year[0]):
+						month_data = monthwise_data.get(year[0]).get(month, {})
+						
+						# Always calculate all three internally
+						for i, fieldname in enumerate(fieldnames_to_process):
+							value = flt(month_data.get(fieldname))
+							period_data[i] += value
+							totals[i] += value
+
+				# Note: Cumulative logic still needs 'Budget' (index 0) and 'Actual' (index 1)
+				period_data[0] += last_total
+
+				if DCC_allocation:
+					period_data[0] = period_data[0] * (DCC_allocation / 100)
+					period_data[1] = period_data[1] * (DCC_allocation / 100)
+
+				if filters.get("show_cumulative"):
+					# This calculation needs both Budget (0) and Actual (1)
+					last_total = period_data[0] - period_data[1]
+
+				# This calculation needs both Budget (0) and Actual (1)
+				period_data[2] = period_data[0] - period_data[1]
+				
+				# *** Modification: Only append Actual (index 1) ***
+				if actual_only:
+					row.append(period_data[1]) 
+				else:
+					# Original logic (append all three: Budget, Actual, Variance)
+					row += period_data
+					
+		# *** Modification: Only append Total Actual (index 1) ***
+		totals[2] = totals[0] - totals[1] # Calculate Total Variance
+		if filters["period"] != "Yearly":
+			if actual_only:
+				row.append(totals[1]) # Only Total Actual
+			else:
+				# Original logic (append all three totals: Budget, Actual, Variance)
+				row += totals 
+				
+		data.append(row)
+
+	return data
+
+
+# Modified to only include Actual columns and Total Actual
 def get_columns(filters):
-	return [
+	columns = [
 		{
 			"label": _(filters.get("budget_against")),
 			"fieldtype": "Link",
 			"fieldname": "budget_against",
 			"options": filters.get("budget_against"),
-			"width": 180,
+			"width": 150,
 		},
 		{
 			"label": _("Account"),
+			"fieldname": "Account",
 			"fieldtype": "Link",
-			"fieldname": "account",
 			"options": "Account",
-			"width": 180,
-		},
-		{
-			"label": _("Actual Value"),
-			"fieldtype": "Float",
-			"fieldname": "actual",
 			"width": 150,
 		},
 	]
 
+	group_months = False if filters["period"] == "Monthly" else True
+
+	fiscal_year = get_fiscal_years(filters)
+
+	for year in fiscal_year:
+		for from_date, to_date in get_period_date_ranges(filters["period"], year[0]):
+			if filters["period"] == "Yearly":
+				# *** Modification: Only include Actual ***
+				labels = [
+					_("Actual") + " " + str(year[0]),
+				]
+				for label in labels:
+					columns.append(
+						{"label": label, "fieldtype": "Float", "fieldname": frappe.scrub(label), "width": 150}
+					)
+			else:
+				# *** Modification: Only include Actual ***
+				for label in [
+					_("Actual") + " (%s)" + " " + str(year[0]),
+				]:
+					if group_months:
+						label = label % (
+							formatdate(from_date, format_string="MMM")
+							+ "-"
+							+ formatdate(to_date, format_string="MMM")
+						)
+					else:
+						label = label % formatdate(from_date, format_string="MMM")
+
+					columns.append(
+						{"label": label, "fieldtype": "Float", "fieldname": frappe.scrub(label), "width": 150}
+					)
+
+	if filters["period"] != "Yearly":
+		# *** Modification: Only include Total Actual ***
+		for label in [_("Total Actual")]:
+			columns.append(
+				{"label": label, "fieldtype": "Float", "fieldname": frappe.scrub(label), "width": 150}
+			)
+
+		return columns
+	else:
+		return columns
+
 
 def get_cost_centers(filters):
+	order_by = ""
 	if filters.get("budget_against") == "Cost Center":
-		return frappe.db.sql_list("""
-			select name from `tabCost Center`
-			where company = %s and is_group = 0 order by lft
-		""", filters.get("company"))
-	elif filters.get("budget_against") == "Project":
-		return frappe.db.sql_list("""
-			select name from `tabProject`
-			where company = %s
-		""", filters.get("company"))
+		order_by = "order by lft"
+
+	if filters.get("budget_against") in ["Cost Center", "Project"]:
+		return frappe.db.sql_list(
+			"""
+				select
+					name
+				from
+					`tab{tab}`
+				where
+					company = %s
+				{order_by}
+			""".format(tab=filters.get("budget_against"), order_by=order_by),
+			filters.get("company"),
+		)
 	else:
-		return frappe.db.sql_list(f"select name from `tab{filters.get('budget_against')}`")
+		return frappe.db.sql_list(
+			"""
+				select
+					name
+				from
+					`tab{tab}`
+			""".format(tab=filters.get("budget_against"))
+		)  # nosec
 
 
-def get_chart_data(data):
+# Get dimension & target details
+def get_dimension_target_details(filters):
+	budget_against = frappe.scrub(filters.get("budget_against"))
+	cond = ""
+	if filters.get("budget_against_filter"):
+		cond += f""" and b.{budget_against} in (%s)""" % ", ".join(
+			["%s"] * len(filters.get("budget_against_filter"))
+		)
+
+	return frappe.db.sql(
+		f"""
+			select
+				b.{budget_against} as budget_against,
+				b.monthly_distribution,
+				ba.account,
+				ba.budget_amount,
+				b.fiscal_year
+			from
+				`tabBudget` b,
+				`tabBudget Account` ba
+			where
+				b.name = ba.parent
+				and b.docstatus = 1
+				and b.fiscal_year between %s and %s
+				and b.budget_against = %s
+				and b.company = %s
+				{cond}
+			order by
+				b.fiscal_year
+		""",
+		tuple(
+			[
+				filters.from_fiscal_year,
+				filters.to_fiscal_year,
+				filters.budget_against,
+				filters.company,
+			]
+			+ (filters.get("budget_against_filter") or [])
+		),
+		as_dict=True,
+	)
+
+
+# Get target distribution details of accounts of cost center
+def get_target_distribution_details(filters):
+	target_details = {}
+	for d in frappe.db.sql(
+		"""
+			select
+				md.name,
+				mdp.month,
+				mdp.percentage_allocation
+			from
+				`tabMonthly Distribution Percentage` mdp,
+				`tabMonthly Distribution` md
+			where
+				mdp.parent = md.name
+				and md.fiscal_year between %s and %s
+			order by
+				md.fiscal_year
+		""",
+		(filters.from_fiscal_year, filters.to_fiscal_year),
+		as_dict=1,
+	):
+		target_details.setdefault(d.name, {}).setdefault(d.month, flt(d.percentage_allocation))
+
+	return target_details
+
+
+# Get actual details from gl entry
+def get_actual_details(name, filters):
+	budget_against = frappe.scrub(filters.get("budget_against"))
+	cond = ""
+
+	if filters.get("budget_against") == "Cost Center":
+		cc_lft, cc_rgt = frappe.db.get_value("Cost Center", name, ["lft", "rgt"])
+		cond = f"""
+				and lft >= "{cc_lft}"
+				and rgt <= "{cc_rgt}"
+			"""
+
+	ac_details = frappe.db.sql(
+		f"""
+			select
+				gl.account,
+				gl.debit,
+				gl.credit,
+				gl.fiscal_year,
+				MONTHNAME(gl.posting_date) as month_name,
+				b.{budget_against} as budget_against
+			from
+				`tabGL Entry` gl,
+				`tabBudget Account` ba,
+				`tabBudget` b
+			where
+				b.name = ba.parent
+				and b.docstatus = 1
+				and ba.account=gl.account
+				and b.{budget_against} = gl.{budget_against}
+				and gl.fiscal_year between %s and %s
+				and gl.is_cancelled = 0
+				and b.{budget_against} = %s
+				and exists(
+					select
+						name
+					from
+						`tab{filters.budget_against}`
+					where
+						name = gl.{budget_against}
+						{cond}
+				)
+				group by
+					gl.name
+				order by gl.fiscal_year
+		""",
+		(filters.from_fiscal_year, filters.to_fiscal_year, name),
+		as_dict=1,
+	)
+
+	cc_actual_details = {}
+	for d in ac_details:
+		cc_actual_details.setdefault(d.account, []).append(d)
+
+	return cc_actual_details
+
+
+def get_dimension_account_month_map(filters):
+	dimension_target_details = get_dimension_target_details(filters)
+	tdd = get_target_distribution_details(filters)
+
+	cam_map = {}
+
+	for ccd in dimension_target_details:
+		actual_details = get_actual_details(ccd.budget_against, filters)
+
+		for month_id in range(1, 13):
+			month = datetime.date(2013, month_id, 1).strftime("%B")
+			cam_map.setdefault(ccd.budget_against, {}).setdefault(ccd.account, {}).setdefault(
+				ccd.fiscal_year, {}
+			).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
+
+			tav_dict = cam_map[ccd.budget_against][ccd.account][ccd.fiscal_year][month]
+			month_percentage = (
+				tdd.get(ccd.monthly_distribution, {}).get(month, 0)
+				if ccd.monthly_distribution
+				else 100.0 / 12
+			)
+
+			tav_dict.target = flt(ccd.budget_amount) * month_percentage / 100
+
+			for ad in actual_details.get(ccd.account, []):
+				if ad.month_name == month and ad.fiscal_year == ccd.fiscal_year:
+					tav_dict.actual += flt(ad.debit) - flt(ad.credit)
+
+	return cam_map
+
+
+def get_fiscal_years(filters):
+	fiscal_year = frappe.db.sql(
+		"""
+			select
+				name
+			from
+				`tabFiscal Year`
+			where
+				name between %(from_fiscal_year)s and %(to_fiscal_year)s
+		""",
+		{"from_fiscal_year": filters["from_fiscal_year"], "to_fiscal_year": filters["to_fiscal_year"]},
+	)
+
+	return fiscal_year
+
+
+# Modified to only include Actual Expense in the chart
+def get_chart_data(filters, columns, data, actual_only=False):
 	if not data:
 		return None
 
-	# aggregate by dimension
-	agg = {}
+	labels = []
+
+	fiscal_year = get_fiscal_years(filters)
+	group_months = False if filters["period"] == "Monthly" else True
+
+	for year in fiscal_year:
+		for from_date, to_date in get_period_date_ranges(filters["period"], year[0]):
+			if filters["period"] == "Yearly":
+				labels.append(year[0])
+			else:
+				if group_months:
+					label = (
+						formatdate(from_date, format_string="MMM")
+						+ "-"
+						+ formatdate(to_date, format_string="MMM")
+					)
+					labels.append(label)
+				else:
+					label = formatdate(from_date, format_string="MMM")
+					labels.append(label)
+
+	no_of_columns = len(labels)
+	
+	# If we are only showing actuals, there is one data point per period.
+	# Otherwise, there were three (Budget, Actual, Variance).
+	data_points_per_period = 1 if actual_only else 3
+
+	budget_values, actual_values = [0] * no_of_columns, [0] * no_of_columns
 	for d in data:
-		agg[d["budget_against"]] = agg.get(d["budget_against"], 0) + d["actual"]
+		# Start from the 3rd column (index 2) as the first two are Dimension and Account
+		values = d[2:]
+		index = 0
 
-	labels = list(agg.keys())
-	values = list(agg.values())
+		for i in range(no_of_columns):
+			if actual_only:
+				# If actual_only is True, values[index] is the Actual amount
+				actual_values[i] += values[index]
+				# index increments by 1
+				index += data_points_per_period 
+			else:
+				# Original logic (Budget is index, Actual is index + 1)
+				budget_values[i] += values[index]
+				actual_values[i] += values[index + 1]
+				# index increments by 3 (Budget, Actual, Variance)
+				index += data_points_per_period
 
+	# *** Modification: Only include Actual Expense dataset ***
+	# If you want to completely remove the chart, return None here.
+	# If you want a chart with only Actual Expense:
 	return {
 		"data": {
 			"labels": labels,
 			"datasets": [
-				{"name": _("Total Actual"), "chartType": "bar", "values": values},
+				# {"name": _("Budget"), "chartType": "bar", "values": budget_values}, # Removed Budget
+				{"name": _("Actual Expense"), "chartType": "bar", "values": actual_values},
 			],
 		},
 		"type": "bar",
