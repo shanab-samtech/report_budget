@@ -12,29 +12,29 @@ from erpnext.controllers.trends import get_period_date_ranges, get_period_month_
 
 
 def execute(filters=None):
-	if not filters:
-		filters = {}
+# ... (rest of execute function remains the same)
+    if not filters:
+        filters = {}
 
-	columns = get_columns(filters)
-	if filters.get("budget_against_filter"):
-		dimensions = filters.get("budget_against_filter")
-	else:
-		dimensions = get_cost_centers(filters)
+    columns = get_columns(filters)
+    if filters.get("budget_against_filter"):
+        dimensions = filters.get("budget_against_filter")
+    else:
+        dimensions = get_cost_centers(filters)
 
-	period_month_ranges = get_period_month_ranges(filters["period"], filters["from_fiscal_year"])
-	cam_map = get_dimension_account_month_map(filters)
+    period_month_ranges = get_period_month_ranges(filters["period"], filters["from_fiscal_year"])
+    cam_map = get_dimension_account_month_map(filters)
 
-	data = []
-	for dimension in dimensions:
-		dimension_items = cam_map.get(dimension)
-		if dimension_items:
-			# Pass actual_only=True to get_final_data
-			data = get_final_data(dimension, dimension_items, filters, period_month_ranges, data, 0, actual_only=True)
+    data = []
+    for dimension in dimensions:
+        dimension_items = cam_map.get(dimension)
+        if dimension_items:
+            # Pass actual_only=True to get_final_data
+            data = get_final_data(dimension, dimension_items, filters, period_month_ranges, data, 0, actual_only=True)
 
-	chart = get_chart_data(filters, columns, data, actual_only=True) # Pass actual_only=True
+    chart = get_chart_data(filters, columns, data, actual_only=True) # Pass actual_only=True
 
-	return columns, data, None, chart
-
+    return columns, data, None, chart
 
 # Modified to only include Actual and exclude Budget and Variance
 def get_final_data(dimension, dimension_items, filters, period_month_ranges, data, DCC_allocation, actual_only=False):
@@ -263,14 +263,38 @@ def get_target_distribution_details(filters):
 def get_actual_details(name, filters):
 	budget_against = frappe.scrub(filters.get("budget_against"))
 	cond = ""
+	
+	# --- MODIFICATION: ADD DATE RANGE FILTER ---
+	if filters.get("from_date"):
+		cond += " and gl.posting_date >= %(from_date)s"
+	if filters.get("to_date"):
+		cond += " and gl.posting_date <= %(to_date)s"
+	# ------------------------------------------
 
 	if filters.get("budget_against") == "Cost Center":
 		cc_lft, cc_rgt = frappe.db.get_value("Cost Center", name, ["lft", "rgt"])
-		cond = f"""
-				and lft >= "{cc_lft}"
-				and rgt <= "{cc_rgt}"
+		cond += f"""
+				and exists(
+					select
+						name
+					from
+						`tabCost Center`
+					where
+						name = gl.{budget_against}
+						and lft >= "{cc_lft}"
+						and rgt <= "{cc_rgt}"
+				)
 			"""
 
+	# --- MODIFICATION: Prepare parameters for frappe.db.sql ---
+	params = {
+		"from_fiscal_year": filters.from_fiscal_year,
+		"to_fiscal_year": filters.to_fiscal_year,
+		"name": name,
+		"from_date": filters.get("from_date"),
+		"to_date": filters.get("to_date"),
+	}
+	
 	ac_details = frappe.db.sql(
 		f"""
 			select
@@ -289,23 +313,15 @@ def get_actual_details(name, filters):
 				and b.docstatus = 1
 				and ba.account=gl.account
 				and b.{budget_against} = gl.{budget_against}
-				and gl.fiscal_year between %s and %s
+				and gl.fiscal_year between %(from_fiscal_year)s and %(to_fiscal_year)s
 				and gl.is_cancelled = 0
-				and b.{budget_against} = %s
-				and exists(
-					select
-						name
-					from
-						`tab{filters.budget_against}`
-					where
-						name = gl.{budget_against}
-						{cond}
-				)
+				and b.{budget_against} = %(name)s
+				{cond}
 				group by
 					gl.name
 				order by gl.fiscal_year
 		""",
-		(filters.from_fiscal_year, filters.to_fiscal_year, name),
+		params, # Pass the parameters dictionary
 		as_dict=1,
 	)
 
@@ -314,7 +330,6 @@ def get_actual_details(name, filters):
 		cc_actual_details.setdefault(d.account, []).append(d)
 
 	return cc_actual_details
-
 
 def get_dimension_account_month_map(filters):
 	dimension_target_details = get_dimension_target_details(filters)
@@ -427,3 +442,32 @@ def get_chart_data(filters, columns, data, actual_only=False):
 		},
 		"type": "bar",
 	}
+ 
+ 
+ 
+ 
+ # Add this new function to your script
+
+def get_all_expense_accounts(filters):
+    """
+    Fetches all non-Group, non-disabled Expense accounts for the company.
+    """
+    return frappe.db.sql_list(
+        """
+            SELECT
+                name
+            FROM
+                `tabAccount`
+            WHERE
+                company = %(company)s
+                AND root_type = 'Expense'
+                AND is_group = 0
+                AND disabled = 0
+            ORDER BY
+                name
+        """,
+        {"company": filters.get("company")},
+    )
+    
+    
+    

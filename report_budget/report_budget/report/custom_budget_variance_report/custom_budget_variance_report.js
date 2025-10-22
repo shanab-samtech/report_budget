@@ -1,12 +1,14 @@
 // Copyright (c) 2025, Samtech and contributors
 // For license information, please see license.txt
 
-
 frappe.query_reports["Custom Budget Variance Report"] = {
 	filters: get_filters(),
 	formatter: function (value, row, column, data, default_formatter) {
 		value = default_formatter(value, row, column, data);
 
+		// NOTE: This formatter targets the 'variance' column which your Python script
+		// is currently configured to hide (actual_only=True).
+		// If you revert 'actual_only=True' in Python, this formatting will work again.
 		if (column.fieldname.includes(__("variance"))) {
 			if (data[column.fieldname] < 0) {
 				value = "<span style='color:red'>" + value + "</span>";
@@ -39,6 +41,22 @@ function get_filters() {
 	let budget_against_options = get_dimensions();
 
 	let filters = [
+		// --- NEW DATE RANGE FILTERS ADDED ---
+		{
+			fieldname: "from_date",
+			label: __("From Date"),
+			fieldtype: "Date",
+			default: frappe.datetime.add_months(frappe.datetime.get_today(), -1),
+			reqd: 0,
+		},
+		{
+			fieldname: "to_date",
+			label: __("To Date"),
+			fieldtype: "Date",
+			default: frappe.datetime.get_today(),
+			reqd: 0,
+		},
+		// ------------------------------------
 		{
 			fieldname: "from_fiscal_year",
 			label: __("From Fiscal Year"),
