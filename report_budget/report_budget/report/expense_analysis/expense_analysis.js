@@ -191,6 +191,18 @@ function get_filters() {
 			fieldtype: "Check",
 			default: 0,
 		},
+		{
+	fieldname: "exclude_zero_accounts",
+	label: __("Exclude Zero Accounts"),
+	fieldtype: "Check",
+	default: 0,
+},
+{
+    fieldname: "remarks",
+    label: __("Remarks"),
+    fieldtype: "Data",
+    description: __("Search for text in GL Entry remarks (partial match)")
+}
 	];
 
 	return filters;
