@@ -30,7 +30,17 @@ def execute(filters=None):
         
         # Ensure fiscal year filters have some value (won't be used but prevents errors)
         if not filters.get("from_fiscal_year"):
-            filters["from_fiscal_year"] = frappe.db.get_value("Fiscal Year", {}, "name")
+            filters["from_fiscal_year"] = (
+                frappe.db.get_value(
+                    "Fiscal Year",
+                    {
+                        "year_start_date": ["<=", filters["from_date"]],
+                        "year_end_date": [">=", filters["from_date"]],
+                    },
+                    "name",
+                )
+                or frappe.db.get_value("Fiscal Year", {}, "name", order_by="year_start_date desc")
+            )
         if not filters.get("to_fiscal_year"):
             filters["to_fiscal_year"] = filters["from_fiscal_year"]
         
@@ -119,25 +129,25 @@ def get_period_date_ranges_from_dates(filters):
             period_start = max(current_date, from_date)
             period_end = min(month_end, to_date)
             date_ranges.append((period_start, period_end))
-            current_date = add_months(current_date, 1)
-            
+            current_date = getdate(add_months(current_date, 1))
+
     elif period == "Quarterly":
         current_date = from_date
         while current_date <= to_date:
-            quarter_end = add_months(current_date, 3) - relativedelta(days=1)
+            quarter_end = getdate(add_months(current_date, 3)) - relativedelta(days=1)
             if quarter_end > to_date:
                 quarter_end = to_date
             date_ranges.append((current_date, quarter_end))
-            current_date = add_months(current_date, 3)
-            
+            current_date = getdate(add_months(current_date, 3))
+
     elif period == "Half-Yearly":
         current_date = from_date
         while current_date <= to_date:
-            half_year_end = add_months(current_date, 6) - relativedelta(days=1)
+            half_year_end = getdate(add_months(current_date, 6)) - relativedelta(days=1)
             if half_year_end > to_date:
                 half_year_end = to_date
             date_ranges.append((current_date, half_year_end))
-            current_date = add_months(current_date, 6)
+            current_date = getdate(add_months(current_date, 6))
             
     elif period == "Yearly":
         # For Yearly, create one range per calendar year in the date range
@@ -160,8 +170,8 @@ def get_period_date_ranges_from_dates(filters):
 
 def get_last_day_of_month(date):
     """Get the last day of the month for a given date"""
-    next_month = add_months(date, 1)
-    return getdate(next_month) - relativedelta(days=next_month.day)
+    next_month_date = getdate(add_months(date, 1))
+    return next_month_date - relativedelta(days=next_month_date.day)
 
 
 def get_final_data_for_dimension(
@@ -753,34 +763,87 @@ def get_actual_details_by_period(name, filters):
     return account_period_map
 
 
+def get_actual_details_no_budget_join(name, filters):
+    """Fetch GL entries for fiscal year mode WITHOUT requiring Budget documents.
+    Returns dict: {account: [list of dicts with month_name, fiscal_year, debit, credit]}
+    """
+    budget_against = frappe.scrub(filters.get("budget_against"))
+    cond = ""
+
+    if filters.get("budget_against") == "Cost Center":
+        cc_lft, cc_rgt = frappe.db.get_value("Cost Center", name, ["lft", "rgt"])
+        cond += f"""
+            and exists(
+                select name from `tabCost Center`
+                where name = gl.{budget_against}
+                and lft >= "{cc_lft}"
+                and rgt <= "{cc_rgt}"
+            )
+        """
+    else:
+        cond += f" and gl.{budget_against} = %(name)s"
+
+    if filters.get("remarks"):
+        cond += " and gl.remarks LIKE %(remarks)s"
+
+    params = {
+        "from_fiscal_year": filters.get("from_fiscal_year"),
+        "to_fiscal_year": filters.get("to_fiscal_year"),
+        "name": name,
+        "company": filters.get("company"),
+        "remarks": f"%{filters.get('remarks')}%" if filters.get("remarks") else None,
+    }
+
+    rows = frappe.db.sql(
+        f"""
+            select
+                gl.account,
+                gl.debit,
+                gl.credit,
+                gl.fiscal_year,
+                MONTHNAME(gl.posting_date) as month_name
+            from
+                `tabGL Entry` gl
+            inner join
+                `tabAccount` acc on acc.name = gl.account
+            where
+                gl.fiscal_year between %(from_fiscal_year)s and %(to_fiscal_year)s
+                and gl.is_cancelled = 0
+                and acc.company = %(company)s
+                and acc.root_type = 'Expense'
+                and acc.is_group = 0
+                {cond}
+            order by gl.posting_date
+        """,
+        params,
+        as_dict=1,
+    )
+
+    result = {}
+    for d in rows:
+        result.setdefault(d.account, []).append(d)
+    return result
+
+
 def get_dimension_account_map_fiscal_year(filters):
-    """Original fiscal year logic - FIXED for Yearly period"""
+    """Fiscal year logic - fetches actuals independent of Budget documents"""
     dimension_target_details = get_dimension_target_details(filters)
     tdd = get_target_distribution_details(filters)
 
     cam_map = {}
     period = filters.get("period", "Monthly")
+    dimensions = filters.get("budget_against_filter") or get_cost_centers(filters)
 
+    # Step 1: Build target (budget) data from Budget documents
     for ccd in dimension_target_details:
-        actual_details = get_actual_details(ccd.budget_against, filters)
-
         if period == "Yearly":
-            # For Yearly period, aggregate all months into one yearly bucket
             cam_map.setdefault(ccd.budget_against, {}).setdefault(ccd.account, {}).setdefault(
                 ccd.fiscal_year, {}
             ).setdefault("Yearly", frappe._dict({"target": 0.0, "actual": 0.0}))
 
             tav_dict = cam_map[ccd.budget_against][ccd.account][ccd.fiscal_year]["Yearly"]
-            
-            # Sum up all monthly targets to get yearly target
             tav_dict.target = flt(ccd.budget_amount)
-
-            # Sum up all actuals for the fiscal year
-            for ad in actual_details.get(ccd.account, []):
-                if ad.fiscal_year == ccd.fiscal_year:
-                    tav_dict.actual += flt(ad.debit) - flt(ad.credit)
         else:
-            # Original monthly/quarterly/half-yearly logic
             for month_id in range(1, 13):
                 month = datetime.date(2013, month_id, 1).strftime("%B")
                 cam_map.setdefault(ccd.budget_against, {}).setdefault(ccd.account, {}).setdefault(
@@ -793,12 +856,28 @@ def get_dimension_account_map_fiscal_year(filters):
                     if ccd.monthly_distribution
                     else 100.0 / 12
                 )
-
                 tav_dict.target = flt(ccd.budget_amount) * month_percentage / 100
 
-                for ad in actual_details.get(ccd.account, []):
-                    if ad.month_name == month and ad.fiscal_year == ccd.fiscal_year:
-                        tav_dict.actual += flt(ad.debit) - flt(ad.credit)
+    # Step 2: Fetch actuals independently (no Budget join) so GL entries show
+    # even when no Budget documents exist for the fiscal year
+    for dimension in dimensions:
+        actual_details = get_actual_details_no_budget_join(dimension, filters)
+
+        for account, entries in actual_details.items():
+            for ad in entries:
+                fiscal_year = ad.fiscal_year
+                month = ad.month_name
+
+                if period == "Yearly":
+                    cam_map.setdefault(dimension, {}).setdefault(account, {}).setdefault(
+                        fiscal_year, {}
+                    ).setdefault("Yearly", frappe._dict({"target": 0.0, "actual": 0.0}))
+                    cam_map[dimension][account][fiscal_year]["Yearly"].actual += flt(ad.debit) - flt(ad.credit)
+                else:
+                    cam_map.setdefault(dimension, {}).setdefault(account, {}).setdefault(
+                        fiscal_year, {}
+                    ).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
+                    cam_map[dimension][account][fiscal_year][month].actual += flt(ad.debit) - flt(ad.credit)
 
     return cam_map
 

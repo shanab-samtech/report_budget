@@ -41,22 +41,6 @@ function get_filters() {
 	let budget_against_options = get_dimensions();
 
 	let filters = [
-		// --- NEW DATE RANGE FILTERS ADDED ---
-		{
-			fieldname: "from_date",
-			label: __("From Date"),
-			fieldtype: "Date",
-			default: frappe.datetime.add_months(frappe.datetime.get_today(), -1),
-			reqd: 0,
-		},
-		{
-			fieldname: "to_date",
-			label: __("To Date"),
-			fieldtype: "Date",
-			default: frappe.datetime.get_today(),
-			reqd: 0,
-		},
-		// ------------------------------------
 		{
 			fieldname: "from_fiscal_year",
 			label: __("From Fiscal Year"),

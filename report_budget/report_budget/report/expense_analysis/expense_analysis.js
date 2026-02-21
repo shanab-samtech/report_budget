@@ -11,6 +11,12 @@ frappe.query_reports["Expense Analysis"] = {
 		report.set_filter_value("from_fiscal_year", current_fiscal_year);
 		report.set_filter_value("to_fiscal_year", current_fiscal_year);
 
+		// Set initial filter visibility to match default filter_type ("Date Range")
+		frappe.query_report.toggle_filter_display("from_fiscal_year", true);
+		frappe.query_report.toggle_filter_display("to_fiscal_year", true);
+		frappe.query_report.toggle_filter_display("from_date", false);
+		frappe.query_report.toggle_filter_display("to_date", false);
+
 		// Get the current default company
 		let company = report.get_filter_value("company");
 
@@ -129,6 +135,7 @@ function get_filters() {
 			label: __("From Fiscal Year"),
 			fieldtype: "Link",
 			options: "Fiscal Year",
+			default: erpnext.utils.get_fiscal_year(frappe.datetime.get_today()),
 			depends_on: "eval:doc.filter_type=='Fiscal Year'",
 		},
 		{
@@ -136,6 +143,7 @@ function get_filters() {
 			label: __("To Fiscal Year"),
 			fieldtype: "Link",
 			options: "Fiscal Year",
+			default: erpnext.utils.get_fiscal_year(frappe.datetime.get_today()),
 			depends_on: "eval:doc.filter_type=='Fiscal Year'",
 		},
 		{

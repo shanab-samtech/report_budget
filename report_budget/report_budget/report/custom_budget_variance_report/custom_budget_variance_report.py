@@ -338,13 +338,6 @@ def get_actual_details(name, filters):
 	budget_against = frappe.scrub(filters.get("budget_against"))
 	cond = ""
 	
-	# --- MODIFICATION: ADD DATE RANGE FILTER ---
-	if filters.get("from_date"):
-		cond += " and gl.posting_date >= %(from_date)s"
-	if filters.get("to_date"):
-		cond += " and gl.posting_date <= %(to_date)s"
-	# ------------------------------------------
-
 	if filters.get("budget_against") == "Cost Center":
 		cc_lft, cc_rgt = frappe.db.get_value("Cost Center", name, ["lft", "rgt"])
 		cond += f"""
@@ -360,13 +353,10 @@ def get_actual_details(name, filters):
 				)
 			"""
 
-	# --- MODIFICATION: Prepare parameters for frappe.db.sql ---
 	params = {
 		"from_fiscal_year": filters.from_fiscal_year,
 		"to_fiscal_year": filters.to_fiscal_year,
 		"name": name,
-		"from_date": filters.get("from_date"),
-		"to_date": filters.get("to_date"),
 	}
 	
 	ac_details = frappe.db.sql(
