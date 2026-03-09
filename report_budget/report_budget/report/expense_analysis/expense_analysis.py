@@ -281,64 +281,37 @@ def get_final_data_row(dimension, account, period_data_map, filters, period_rang
             else:
                 row += period_data
     else:
-        # Fiscal Year Logic - FIXED for Yearly period
+        # Fiscal Year Logic — works for all periods including Yearly.
+        # For Yearly, period_ranges = [["January","February",...,"December"]] (one group of 12 months),
+        # so this loop naturally produces one summed column — no special "Yearly" key needed.
         for year in get_fiscal_years(filters):
-            if period == "Yearly":
-                # For Yearly period, get data directly from "Yearly" key
+            for relevant_months in period_ranges:
                 period_data = [0, 0, 0]
-                
-                if period_data_map.get(year[0]):
-                    yearly_data = period_data_map.get(year[0]).get("Yearly", {})
-                    
-                    for i, fieldname in enumerate(fieldnames_to_process):
-                        value = flt(yearly_data.get(fieldname))
-                        period_data[i] += value
-                        totals[i] += value
-                
+
+                for month in relevant_months:
+                    if period_data_map.get(year[0]):
+                        month_data = period_data_map.get(year[0]).get(month, {})
+
+                        for i, fieldname in enumerate(fieldnames_to_process):
+                            value = flt(month_data.get(fieldname))
+                            period_data[i] += value
+                            totals[i] += value
+
                 period_data[0] += last_total
-                
+
                 if DCC_allocation:
                     period_data[0] = period_data[0] * (DCC_allocation / 100)
                     period_data[1] = period_data[1] * (DCC_allocation / 100)
-                
+
                 if filters.get("show_cumulative"):
                     last_total = period_data[0] - period_data[1]
-                
+
                 period_data[2] = period_data[0] - period_data[1]
-                
+
                 if actual_only:
                     row.append(period_data[1])
                 else:
                     row += period_data
-            else:
-                # Original logic for Monthly/Quarterly/Half-Yearly
-                for relevant_months in period_ranges:
-                    period_data = [0, 0, 0]
-                    
-                    for month in relevant_months:
-                        if period_data_map.get(year[0]):
-                            month_data = period_data_map.get(year[0]).get(month, {})
-                            
-                            for i, fieldname in enumerate(fieldnames_to_process):
-                                value = flt(month_data.get(fieldname))
-                                period_data[i] += value
-                                totals[i] += value
-                    
-                    period_data[0] += last_total
-                    
-                    if DCC_allocation:
-                        period_data[0] = period_data[0] * (DCC_allocation / 100)
-                        period_data[1] = period_data[1] * (DCC_allocation / 100)
-                    
-                    if filters.get("show_cumulative"):
-                        last_total = period_data[0] - period_data[1]
-                    
-                    period_data[2] = period_data[0] - period_data[1]
-                    
-                    if actual_only:
-                        row.append(period_data[1])
-                    else:
-                        row += period_data
     
     totals[2] = totals[0] - totals[1]
     
@@ -718,6 +691,7 @@ def get_actual_details_by_period(name, filters):
                 gl.{budget_against} = %(name)s
                 and gl.posting_date between %(from_date)s and %(to_date)s
                 and gl.is_cancelled = 0
+                and gl.voucher_type != 'Period Closing Voucher'
                 and acc.company = %(company)s
                 and acc.root_type = 'Expense'
                 and acc.is_group = 0
@@ -809,6 +783,7 @@ def get_actual_details_no_budget_join(name, filters):
             where
                 gl.fiscal_year between %(from_fiscal_year)s and %(to_fiscal_year)s
                 and gl.is_cancelled = 0
+                and gl.voucher_type != 'Period Closing Voucher'
                 and acc.company = %(company)s
                 and acc.root_type = 'Expense'
                 and acc.is_group = 0
@@ -831,35 +806,30 @@ def get_dimension_account_map_fiscal_year(filters):
     tdd = get_target_distribution_details(filters)
 
     cam_map = {}
-    period = filters.get("period", "Monthly")
     dimensions = filters.get("budget_against_filter") or get_cost_centers(filters)
 
-    # Step 1: Build target (budget) data from Budget documents
+    # Step 1: Build target (budget) data from Budget documents.
+    # Always distribute by month name so get_final_data_row's unified monthly iteration
+    # can sum them correctly for all periods (Monthly, Quarterly, Half-Yearly, Yearly).
     for ccd in dimension_target_details:
-        if period == "Yearly":
+        for month_id in range(1, 13):
+            month = datetime.date(2013, month_id, 1).strftime("%B")
             cam_map.setdefault(ccd.budget_against, {}).setdefault(ccd.account, {}).setdefault(
                 ccd.fiscal_year, {}
-            ).setdefault("Yearly", frappe._dict({"target": 0.0, "actual": 0.0}))
+            ).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
 
-            tav_dict = cam_map[ccd.budget_against][ccd.account][ccd.fiscal_year]["Yearly"]
-            tav_dict.target = flt(ccd.budget_amount)
-        else:
-            for month_id in range(1, 13):
-                month = datetime.date(2013, month_id, 1).strftime("%B")
-                cam_map.setdefault(ccd.budget_against, {}).setdefault(ccd.account, {}).setdefault(
-                    ccd.fiscal_year, {}
-                ).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
-
-                tav_dict = cam_map[ccd.budget_against][ccd.account][ccd.fiscal_year][month]
-                month_percentage = (
-                    tdd.get(ccd.monthly_distribution, {}).get(month, 0)
-                    if ccd.monthly_distribution
-                    else 100.0 / 12
-                )
-                tav_dict.target = flt(ccd.budget_amount) * month_percentage / 100
+            tav_dict = cam_map[ccd.budget_against][ccd.account][ccd.fiscal_year][month]
+            month_percentage = (
+                tdd.get(ccd.monthly_distribution, {}).get(month, 0)
+                if ccd.monthly_distribution
+                else 100.0 / 12
+            )
+            tav_dict.target = flt(ccd.budget_amount) * month_percentage / 100
 
     # Step 2: Fetch actuals independently (no Budget join) so GL entries show
-    # even when no Budget documents exist for the fiscal year
+    # even when no Budget documents exist for the fiscal year.
+    # Always store by month name — the period grouping in get_final_data_row handles
+    # aggregation for Quarterly/Half-Yearly/Yearly periods.
     for dimension in dimensions:
         actual_details = get_actual_details_no_budget_join(dimension, filters)
 
@@ -868,16 +838,10 @@ def get_dimension_account_map_fiscal_year(filters):
                 fiscal_year = ad.fiscal_year
                 month = ad.month_name
 
-                if period == "Yearly":
-                    cam_map.setdefault(dimension, {}).setdefault(account, {}).setdefault(
-                        fiscal_year, {}
-                    ).setdefault("Yearly", frappe._dict({"target": 0.0, "actual": 0.0}))
-                    cam_map[dimension][account][fiscal_year]["Yearly"].actual += flt(ad.debit) - flt(ad.credit)
-                else:
-                    cam_map.setdefault(dimension, {}).setdefault(account, {}).setdefault(
-                        fiscal_year, {}
-                    ).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
-                    cam_map[dimension][account][fiscal_year][month].actual += flt(ad.debit) - flt(ad.credit)
+                cam_map.setdefault(dimension, {}).setdefault(account, {}).setdefault(
+                    fiscal_year, {}
+                ).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
+                cam_map[dimension][account][fiscal_year][month].actual += flt(ad.debit) - flt(ad.credit)
 
     return cam_map
 

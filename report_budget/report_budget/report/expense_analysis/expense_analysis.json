@@ -1,5 +1,5 @@
 {
- "add_total_row": 0,
+ "add_total_row": 1,
  "add_translate_data": 0,
  "columns": [],
  "creation": "2025-10-24 04:46:42.918659",
@@ -9,8 +9,8 @@
  "filters": [],
  "idx": 0,
  "is_standard": "Yes",
- "letterhead": null,
- "modified": "2025-10-24 04:46:42.918659",
+ "letter_head": null,
+ "modified": "2026-02-21 13:40:49.259837",
  "modified_by": "Administrator",
  "module": "Report Budget",
  "name": "Expense Analysis",
