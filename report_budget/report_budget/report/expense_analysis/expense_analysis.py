@@ -61,8 +61,20 @@ def execute(filters=None):
         
         frappe.logger().debug(f"Fiscal Year Mode: {from_fiscal_year} to {to_fiscal_year}")
     
+    has_english_name = frappe.get_meta("Account").has_field("custom_account_english_name")
+    filters["_has_english_name"] = has_english_name
+
+    if has_english_name:
+        rows = frappe.db.sql(
+            """SELECT name, custom_account_english_name FROM `tabAccount`
+               WHERE company = %s AND root_type = 'Expense' AND is_group = 0""",
+            filters.get("company"),
+            as_dict=True,
+        )
+        filters["_account_english_names"] = {r.name: r.custom_account_english_name for r in rows}
+
     columns = get_columns(filters)
-    
+
     if filters.get("budget_against_filter"):
         dimensions = filters.get("budget_against_filter")
     else:
@@ -248,6 +260,9 @@ def get_final_data_row(dimension, account, period_data_map, filters, period_rang
     filter_type = filters.get("filter_type", "Date Range")
     period = filters.get("period", "Monthly")
     row = [dimension, account]
+    if filters.get("_has_english_name"):
+        english_name = (filters.get("_account_english_names") or {}).get(account, "")
+        row.insert(2, english_name)
     totals = [0, 0, 0]  # totals[0]=Budget, totals[1]=Actual, totals[2]=Variance
     
     fieldnames_to_process = ["target", "actual", "variance"]
@@ -353,6 +368,14 @@ def get_columns(filters):
         },
     ]
 
+    if filters.get("_has_english_name"):
+        columns.insert(2, {
+            "label": _("Account English Name"),
+            "fieldname": "account_english_name",
+            "fieldtype": "Data",
+            "width": 200,
+        })
+
     group_months = False if filters["period"] == "Monthly" else True
 
     if filter_type == "Date Range":
@@ -428,9 +451,8 @@ def filter_zero_accounts(data, filters):
     filtered_data = []
     
     for row in data:
-        # Skip first 2 columns (dimension and account name)
-        # Check all remaining numeric values
-        numeric_values = row[2:]
+        data_cols = 3 if filters.get("_has_english_name") else 2
+        numeric_values = row[data_cols:]
         
         # If any value is non-zero, keep the row
         has_non_zero = any(flt(val) != 0 for val in numeric_values)
@@ -908,7 +930,8 @@ def get_chart_data(filters, columns, data, actual_only=False):
     budget_values, actual_values = [0] * no_of_columns, [0] * no_of_columns
     
     for d in data:
-        values = d[2:]  # Skip dimension and account columns
+        data_cols = 3 if filters.get("_has_english_name") else 2
+        values = d[data_cols:]
         index = 0
 
         for i in range(no_of_columns):
