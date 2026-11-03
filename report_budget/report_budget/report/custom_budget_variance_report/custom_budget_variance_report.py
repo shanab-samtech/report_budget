@@ -2,13 +2,13 @@
 # For license information, please see license.txt
 
 
-import datetime
-
 import frappe
 from frappe import _
 from frappe.utils import flt, formatdate
 
 from erpnext.controllers.trends import get_period_date_ranges, get_period_month_ranges
+
+from report_budget.report_budget.budget_targets import get_budget_targets
 
 
 def execute(filters=None):
@@ -264,75 +264,6 @@ def get_cost_centers(filters):
 		)  # nosec
 
 
-# Get dimension & target details
-def get_dimension_target_details(filters):
-	budget_against = frappe.scrub(filters.get("budget_against"))
-	cond = ""
-	if filters.get("budget_against_filter"):
-		cond += f""" and b.{budget_against} in (%s)""" % ", ".join(
-			["%s"] * len(filters.get("budget_against_filter"))
-		)
-
-	return frappe.db.sql(
-		f"""
-			select
-				b.{budget_against} as budget_against,
-				b.monthly_distribution,
-				ba.account,
-				ba.budget_amount,
-				b.fiscal_year
-			from
-				`tabBudget` b,
-				`tabBudget Account` ba
-			where
-				b.name = ba.parent
-				and b.docstatus = 1
-				and b.fiscal_year between %s and %s
-				and b.budget_against = %s
-				and b.company = %s
-				{cond}
-			order by
-				b.fiscal_year
-		""",
-		tuple(
-			[
-				filters.from_fiscal_year,
-				filters.to_fiscal_year,
-				filters.budget_against,
-				filters.company,
-			]
-			+ (filters.get("budget_against_filter") or [])
-		),
-		as_dict=True,
-	)
-
-
-# Get target distribution details of accounts of cost center
-def get_target_distribution_details(filters):
-	target_details = {}
-	for d in frappe.db.sql(
-		"""
-			select
-				md.name,
-				mdp.month,
-				mdp.percentage_allocation
-			from
-				`tabMonthly Distribution Percentage` mdp,
-				`tabMonthly Distribution` md
-			where
-				mdp.parent = md.name
-				and md.fiscal_year between %s and %s
-			order by
-				md.fiscal_year
-		""",
-		(filters.from_fiscal_year, filters.to_fiscal_year),
-		as_dict=1,
-	):
-		target_details.setdefault(d.name, {}).setdefault(d.month, flt(d.percentage_allocation))
-
-	return target_details
-
-
 # Get actual details from gl entry
 def get_actual_details(name, filters):
 	budget_against = frappe.scrub(filters.get("budget_against"))
@@ -370,15 +301,14 @@ def get_actual_details(name, filters):
 				b.{budget_against} as budget_against
 			from
 				`tabGL Entry` gl,
-				`tabBudget Account` ba,
 				`tabBudget` b
 			where
-				b.name = ba.parent
-				and b.docstatus = 1
-				and ba.account=gl.account
+				b.docstatus = 1
+				and b.account = gl.account
 				and b.{budget_against} = gl.{budget_against}
 				and gl.fiscal_year between %(from_fiscal_year)s and %(to_fiscal_year)s
 				and gl.is_cancelled = 0
+				and gl.voucher_type != 'Period Closing Voucher'
 				and b.{budget_against} = %(name)s
 				{cond}
 				group by
@@ -396,32 +326,30 @@ def get_actual_details(name, filters):
 	return cc_actual_details
 
 def get_dimension_account_month_map(filters):
-	dimension_target_details = get_dimension_target_details(filters)
-	tdd = get_target_distribution_details(filters)
-
 	cam_map = {}
 
-	for ccd in dimension_target_details:
-		actual_details = get_actual_details(ccd.budget_against, filters)
+	def get_month_bucket(dimension, account, fiscal_year, month):
+		return (
+			cam_map.setdefault(dimension, {})
+			.setdefault(account, {})
+			.setdefault(fiscal_year, {})
+			.setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
+		)
 
-		for month_id in range(1, 13):
-			month = datetime.date(2013, month_id, 1).strftime("%B")
-			cam_map.setdefault(ccd.budget_against, {}).setdefault(ccd.account, {}).setdefault(
-				ccd.fiscal_year, {}
-			).setdefault(month, frappe._dict({"target": 0.0, "actual": 0.0}))
+	# Targets come from v16 Budget Distribution rows, split per month
+	for target in get_budget_targets(filters):
+		get_month_bucket(target.budget_against, target.account, target.fiscal_year, target.month).target += (
+			target.amount
+		)
 
-			tav_dict = cam_map[ccd.budget_against][ccd.account][ccd.fiscal_year][month]
-			month_percentage = (
-				tdd.get(ccd.monthly_distribution, {}).get(month, 0)
-				if ccd.monthly_distribution
-				else 100.0 / 12
-			)
-
-			tav_dict.target = flt(ccd.budget_amount) * month_percentage / 100
-
-			for ad in actual_details.get(ccd.account, []):
-				if ad.month_name == month and ad.fiscal_year == ccd.fiscal_year:
-					tav_dict.actual += flt(ad.debit) - flt(ad.credit)
+	# Actuals only for accounts budgeted against each dimension
+	for dimension, budgeted_accounts in cam_map.items():
+		actual_details = get_actual_details(dimension, filters)
+		for account in list(budgeted_accounts):
+			for ad in actual_details.get(account, []):
+				get_month_bucket(dimension, account, ad.fiscal_year, ad.month_name).actual += flt(ad.debit) - flt(
+					ad.credit
+				)
 
 	return cam_map
 
